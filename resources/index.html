@@ -100,7 +100,9 @@
   </div>
   <script>
     const BASE = "http://127.0.0.1:3080/dsh-pet-7340";
-    const IDLE = "待机呼吸休闲";
+    // The pack's idle clip; /config names it at boot (a custom pack may call its
+    // idle anything).
+    let idleName = "待机呼吸休闲";
     const FLING_SPEED = 350; // px/s; drag release faster than this becomes a fling
     const stage = document.getElementById("stage");
     const viewport = document.getElementById("viewport");
@@ -116,16 +118,11 @@
     let petId = "main";  // resolved from Pet.WhoAmI once the bridge is up
     let currentPlayback = null; // playbackId of the animation now on screen
 
-    // WKWebView decodes HEVC-with-alpha .mov; WebKitGTK and WebView2 decode
-    // VP9-with-alpha .webm. MyGo injects `mygo.platform`; the user agent is the
-    // fallback if the page runs outside a MyGo window.
-    const platform = (() => {
-      try { return mygo.platform; } catch (e) { /* not in MyGo */ }
-      return /Mac/.test(navigator.userAgent) ? "darwin" : "linux";
-    })();
-    const ASSET_DIR = platform === "darwin" ? "anim/" : "anim-webm/";
-    const ASSET_EXT = platform === "darwin" ? ".mov" : ".webm";
-    const src = (name) => ASSET_DIR + encodeURIComponent(name) + ASSET_EXT;
+    // Clips are served by the host (/asset), which picks the pet's own pack and
+    // the format this platform's webview decodes; the page never builds a
+    // filesystem path, so a custom pack outside resources/ works the same.
+    const src = (name) =>
+      BASE + "/asset?pet=" + encodeURIComponent(petId) + "&name=" + encodeURIComponent(name);
 
     // Report a playback status back to the host (receipt via GET /playback/{id}).
     function report(playbackId, status) {
@@ -230,7 +227,7 @@
       }
 
       inV.dataset.name = name;
-      inV.loop = name === IDLE;
+      inV.loop = name === idleName;
       inV.src = src(name);
       inV.play().then(async () => {
         await firstFrame(inV);
@@ -241,7 +238,7 @@
         // Reclaim the outgoing layer once the fade ends, unless it holds the
         // idle loop (keep it warm for a cheap switch back).
         const old = outV;
-        if (old.dataset.name !== IDLE) {
+        if (old.dataset.name !== idleName) {
           setTimeout(() => {
             old.pause();
             old.removeAttribute("src");
@@ -264,7 +261,7 @@
       report(currentPlayback, "completed");
       currentPlayback = null;
       const gen = playGen;
-      setTimeout(() => { if (gen === playGen) play(IDLE); }, 1200);
+      setTimeout(() => { if (gen === playGen) play(idleName); }, 1200);
     }));
     // Mirror the video when the pet faces left.
     function setFacing(f) {
@@ -366,9 +363,9 @@
     stage.addEventListener("pointerup", onUp);
     stage.addEventListener("pointercancel", onUp);
 
-    // Bridge self-check + resolve our pet id, surfaced if the page can't reach Go.
+    // Bridge self-check, surfaced if the page can't reach Go. The pet id is
+    // resolved at boot, before the first frame (see the bottom of this script).
     try {
-      mygo.call("Pet.WhoAmI").then((id) => { petId = id; });
       mygo.call("Pet.Ping").catch((e) => say("bridge 失败: " + e, 6000));
     } catch (e) {
       say("bridge 异常: " + e, 6000);
@@ -383,10 +380,12 @@
       try {
         const r = await fetch(BASE + "/config", { cache: "no-store" });
         const c = await r.json();
-        animPools = (c.main && c.main.animations) || {};
+        const own = c[petId] || c.main;
+        animPools = (own && own.animations) || {};
       } catch (e) {
-        animPools = { idle: [IDLE] };
+        animPools = {};
       }
+      if (animPools.idle && animPools.idle.length) idleName = animPools.idle[0];
       return animPools;
     }
 
@@ -414,7 +413,7 @@
       const sep = () => { const d = document.createElement("div"); d.className = "sep"; menu.appendChild(d); };
       const grp = (label) => { const d = document.createElement("div"); d.className = "grp"; d.textContent = label; menu.appendChild(d); };
       sep();
-      const p = animPools || { idle: [IDLE] };
+      const p = animPools || {};
       const groups = [["待机", p.idle], ["转向", p.turn], ["移动", p.moves], ["点击回应", p.clicks], ["动作", p.actions]];
       // Flat list grouped by category, scrolling inside the window.
       for (const [label, items] of groups) {
@@ -471,8 +470,23 @@
       setTimeout(poll, 400);
     }
 
-    play(IDLE); // start on the idle loop; /state will switch it when commanded
-    poll();
+    // Resolve this window's pet before the first frame: its id selects the pack
+    // its clips come from, so a custom-pack pet never flashes the built-in one.
+    let booted = false;
+    function boot() {
+      if (booted) return;
+      booted = true;
+      loadPools().then(() => {
+        play(idleName); // start on the idle loop; /state switches it later
+        poll();
+      });
+    }
+    try {
+      mygo.call("Pet.WhoAmI").then((id) => { if (id) petId = id; boot(); }).catch(boot);
+      setTimeout(boot, 800); // bridge absent: fall back to the default pet
+    } catch (e) {
+      boot();
+    }
   </script>
 </body>
 </html>

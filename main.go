@@ -28,8 +28,11 @@ import (
 )
 
 const (
-	listenAddr  = "127.0.0.1:3080"
+	listenAddr = "127.0.0.1:3080"
+	// idleAnim and turnAnim are the names the built-in pack (and dsh-pet) use;
+	// a custom pack gets its own idle via scanPack.
 	idleAnim    = "待机呼吸休闲"
+	turnAnim    = "东张西望"
 	baseW       = 640 // animation canvas
 	baseH       = 360
 	movAnimDir  = "resources/anim"      // HEVC-with-alpha .mov (WKWebView)
@@ -46,11 +49,6 @@ const (
 // windowW/H and the fallback hit box are derived from the config scale at
 // startup (see applyScale), so the whole canvas scales together.
 var (
-	// Windows' WKWebView plays HEVC-with-alpha .mov; WebKitGTK and WebView2
-	// play VP9-with-alpha .webm. Pick the set the platform's webview decodes.
-	animDir = movAnimDir
-	animExt = ".mov"
-
 	windowW = baseW
 	windowH = baseH
 	hitMinX = petHitMinX
@@ -59,11 +57,14 @@ var (
 	hitMaxY = petHitMaxY
 )
 
-func init() {
-	if runtime.GOOS != "darwin" {
-		animDir = webmAnimDir
-		animExt = ".webm"
+// packLayout picks the asset subdirectory and extension the platform's webview
+// can decode: WKWebView plays HEVC-with-alpha .mov, WebKitGTK and WebView2 play
+// VP9-with-alpha .webm. Both the built-in and custom packs use the same names.
+func packLayout() (sub, ext string) {
+	if runtime.GOOS == "darwin" {
+		return "anim", ".mov"
 	}
+	return "anim-webm", ".webm"
 }
 
 // applyScale sizes the window (and the fallback hit box) to the canvas times
@@ -84,7 +85,8 @@ func applyScale(size float64) {
 }
 
 // workStatusAnims is the animation pool for the six work-status tiers, in the
-// same order dsh-pet uses (and the same names as resources/anim/*.mov).
+// same order dsh-pet uses. It is matched against a pack's clips, so a pack that
+// carries the same tier names exposes them to /config consumers.
 var workStatusAnims = []string{
 	"工作状态-思考冒泡",
 	"工作状态-忙碌点按",
@@ -94,20 +96,208 @@ var workStatusAnims = []string{
 	"工作状态-垂头叹气冒汗",
 }
 
-// roamAnims are the walk animations played while the pet roams across screen.
+// roamAnims are the walk animations played while a pet roams across screen.
 var roamAnims = []string{"螃蟹走路", "原地漂浮踏步", "原地左转奔跑"}
 
-// clickAnims play when the pet is clicked (random pick).
-var clickAnims = []string{
-	"点击回应-开心跃动",
-	"点击回应-害羞惊讶",
-	"点击回应-傲娇生气",
-	"点击回应-挠痒咯咯笑",
-	"点击回应-元气挥手",
+// Animation name families a pack is split by. Every clip is classified by name,
+// so a custom pack keeps dsh-pet's asset names and needs no extra config.
+const (
+	workPrefix    = "工作状态-"
+	clickPrefix   = "点击回应-"
+	whisperPrefix = "碎碎念-"
+	balancePrefix = "余额-"
+)
+
+// animPack is one pet kind ("pet pack"): the asset directory for this
+// platform's webview plus the pools the animation chain picks from. The
+// built-in pack reads resources/anim(-webm); a custom pack reads
+// ~/.config/dsh-pet-mygo/pets/<pack>/anim(-webm).
+type animPack struct {
+	name string // "" for the built-in pack
+	dir  string
+	ext  string
+
+	idle     string
+	turn     string
+	roam     []string
+	clicks   []string
+	whispers []string
+	work     []string
+	actions  []string
+
+	durs sync.Map // animation name -> time.Duration, per pack (names can repeat)
 }
 
-// whisperAnims play while the pet mutters to itself.
-var whisperAnims = []string{"碎碎念-擦桌碎碎念", "碎碎念-发呆碎碎念", "碎碎念-对屏碎碎念"}
+// path is an animation's asset file in this pack.
+func (p *animPack) path(name string) string {
+	return filepath.Join(p.dir, name+p.ext)
+}
+
+// contentType is what the page expects for this pack's asset extension.
+func (p *animPack) contentType() string {
+	if p.ext == ".webm" {
+		return "video/webm"
+	}
+	return "video/quicktime"
+}
+
+// duration is the clip's real playback length, cached per pack, falling back to
+// animPlaySec when the asset can't be read.
+func (p *animPack) duration(name string) time.Duration {
+	if v, ok := p.durs.Load(name); ok {
+		return v.(time.Duration)
+	}
+	var (
+		secs float64
+		err  error
+	)
+	if p.ext == ".webm" {
+		secs, err = webmDuration(p.path(name))
+	} else {
+		secs, err = movDuration(p.path(name))
+	}
+	if err != nil || secs <= 0 || secs > 120 {
+		secs = float64(animPlaySec)
+	}
+	dur := time.Duration(secs * float64(time.Second))
+	p.durs.Store(name, dur)
+	return dur
+}
+
+// scanPack enumerates an asset directory and splits its clips into the pools
+// the chain plays. Classification is by name: 工作状态-* tiers, 点击回应-*
+// reactions, 碎碎念-* mutters, 余额-* balance tiers (unused here), 东张西望 for
+// the turn, roamAnims for walking; everything else joins the random pool.
+func scanPack(name, dir, ext string) (*animPack, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	p := &animPack{name: name, dir: dir, ext: ext}
+	isRoam := make(map[string]bool, len(roamAnims))
+	for _, r := range roamAnims {
+		isRoam[r] = true
+	}
+	var all []string
+	for _, e := range entries {
+		file := e.Name()
+		if e.IsDir() || !strings.HasSuffix(file, ext) {
+			continue
+		}
+		base := strings.TrimSuffix(file, ext)
+		all = append(all, base)
+		switch {
+		case strings.HasPrefix(base, workPrefix):
+			p.work = append(p.work, base)
+		case strings.HasPrefix(base, clickPrefix):
+			p.clicks = append(p.clicks, base)
+		case strings.HasPrefix(base, whisperPrefix):
+			p.whispers = append(p.whispers, base)
+		case strings.HasPrefix(base, balancePrefix):
+			// Reserved: this port has no balance source, so those clips are never
+			// played and must not leak into the random pool.
+		case base == idleAnim:
+			p.idle = base
+		case base == turnAnim:
+			p.turn = base
+		case isRoam[base]:
+			p.roam = append(p.roam, base)
+		default:
+			p.actions = append(p.actions, base)
+		}
+	}
+	if len(all) == 0 {
+		return nil, fmt.Errorf("no %s files in %s", ext, dir)
+	}
+	if p.idle == "" {
+		// No canonical idle name: take the first 待机 clip, else the first clip,
+		// so a pack with entirely new names still has something to loop.
+		for _, n := range all {
+			if strings.Contains(n, "待机") {
+				p.idle = n
+				break
+			}
+		}
+		if p.idle == "" {
+			p.idle = all[0]
+		}
+		// The fallback idle was classified as a random action above.
+		p.actions = removeName(p.actions, p.idle)
+	}
+	if p.turn == "" {
+		p.turn = p.idle
+	}
+	return p, nil
+}
+
+// removeName returns names without target (used when a fallback idle has to
+// leave the random pool).
+func removeName(names []string, target string) []string {
+	out := names[:0]
+	for _, n := range names {
+		if n != target {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// packFor loads a named pack from disk: "" is the built-in resources/ tree,
+// anything else is ~/.config/dsh-pet-mygo/pets/<name>/.
+func packFor(name, sub, ext string) (*animPack, error) {
+	if name == "" {
+		return scanPack("", filepath.Join("resources", sub), ext)
+	}
+	return scanPack(name, filepath.Join(filepath.Dir(configPath()), "pets", name, sub), ext)
+}
+
+// loadPacks resolves each pet's pack once at startup. A broken pack is reported
+// and that pet falls back to the built-in one, so one bad directory can't take
+// every window down.
+func (s *server) loadPacks() {
+	sub, ext := packLayout()
+	builtin, err := packFor("", sub, ext)
+	if err != nil {
+		log.Printf("built-in pack unusable (%v); run from the repo root", err)
+		builtin = &animPack{dir: filepath.Join("resources", sub), ext: ext, idle: idleAnim, turn: idleAnim}
+	}
+	s.builtin = builtin
+	s.packs = make(map[string]*animPack, len(s.cfg.Pets))
+	cache := map[string]*animPack{"": builtin}
+	for _, pc := range s.cfg.Pets {
+		if pc.Pack == "" {
+			s.packs[pc.ID] = builtin
+			continue
+		}
+		// A pack is a directory name, never a path: keep it inside pets/.
+		if pc.Pack == "." || pc.Pack == ".." || strings.ContainsAny(pc.Pack, `/\`) {
+			log.Printf("pack %q for pet %s is not a directory name; using the built-in pack", pc.Pack, pc.ID)
+			s.packs[pc.ID] = builtin
+			continue
+		}
+		if p, ok := cache[pc.Pack]; ok {
+			s.packs[pc.ID] = p
+			continue
+		}
+		p, err := packFor(pc.Pack, sub, ext)
+		if err != nil {
+			log.Printf("pack %q unusable for pet %s (%v); using the built-in pack", pc.Pack, pc.ID, err)
+			p = builtin
+		} else {
+			cache[pc.Pack] = p
+		}
+		s.packs[pc.ID] = p
+	}
+}
+
+// packOf returns a pet's pack, falling back to the built-in one for ids that
+// only ever existed in an HTTP request.
+func (s *server) packOf(id string) *animPack {
+	if p := s.packs[id]; p != nil {
+		return p
+	}
+	return s.builtin
+}
 
 // whisperLines are the built-in fallback when no model provider is configured:
 // the pet picks one at random, so it still talks without an LLM.
@@ -251,11 +441,14 @@ const (
 
 const animPlaySec = 6 // how long a chain animation plays before the next pick
 
-// petConfig lists a pet to spawn; each gets its own window.
+// petConfig lists a pet to spawn; each gets its own window. Pack selects the
+// pet kind: empty is the built-in blue maid, anything else is a directory under
+// ~/.config/dsh-pet-mygo/pets/<pack>/ (see README).
 type petConfig struct {
-	ID string `json:"id"`
-	X  int    `json:"x"` // window top-left, logical screen coords
-	Y  int    `json:"y"`
+	ID   string `json:"id"`
+	Pack string `json:"pack,omitempty"`
+	X    int    `json:"x"` // window top-left, logical screen coords
+	Y    int    `json:"y"`
 }
 
 var defaultPets = []petConfig{
@@ -281,23 +474,33 @@ func configPath() string {
 	return filepath.Join(home, ".config", "dsh-pet-mygo", "config.json")
 }
 
+// defaultConfig returns a fresh copy of the defaults. The Pets slice is copied
+// because callers (savePositions) mutate it in place, and a shared backing array
+// would rewrite the package-level defaults for every later load.
+func defaultConfig() appConfig {
+	return appConfig{Size: 0.7, Pets: append([]petConfig(nil), defaultPets...)}
+}
+
 // loadConfig reads the user config, falling back to defaults. On first run it
 // writes a default file so the user has something to edit.
 func loadConfig() appConfig {
-	cfg := appConfig{Size: 0.7, Pets: defaultPets}
+	cfg := defaultConfig()
 	data, err := os.ReadFile(configPath())
 	if err != nil {
 		saveConfig(cfg)
 		return cfg
 	}
-	if err := json.Unmarshal(data, &cfg); err != nil || len(cfg.Pets) == 0 {
+	// Unmarshal into a fresh value: reusing cfg's slice would overwrite the
+	// defaults' backing array as a side effect.
+	loaded := appConfig{}
+	if err := json.Unmarshal(data, &loaded); err != nil || len(loaded.Pets) == 0 {
 		log.Printf("config %s invalid, using defaults", configPath())
-		cfg = appConfig{Size: 0.7, Pets: defaultPets}
+		return cfg
 	}
-	if cfg.Size <= 0 {
-		cfg.Size = 1
+	if loaded.Size <= 0 {
+		loaded.Size = 1
 	}
-	return cfg
+	return loaded
 }
 
 func saveConfig(cfg appConfig) {
@@ -330,10 +533,10 @@ type petState struct {
 	Facing field `json:"facing"` // "left" or "right"; the page mirrors the video on left
 }
 
-// newPetState returns a pet's initial state.
-func newPetState() *petState {
+// newPetState returns a pet's initial state; idle is the pack's idle clip.
+func newPetState(idle string) *petState {
 	return &petState{
-		Anim:   field{Counter: 0, Data: map[string]any{"name": idleAnim}},
+		Anim:   field{Counter: 0, Data: map[string]any{"name": idle}},
 		Say:    field{Counter: 0, Data: nil},
 		Facing: field{Counter: 0, Data: "right"},
 	}
@@ -378,6 +581,8 @@ type server struct {
 	petHome     map[string][2]int      // pet id -> initial (x, y)
 	menuOpen    map[*mygo.Window]bool  // right-click menu open per window
 	cfg         appConfig              // loaded user config; positions persisted back
+	packs       map[string]*animPack   // pet id -> pack (read-only after startup)
+	builtin     *animPack              // fallback pack for unknown pet ids
 	hitBox      map[string][4]int      // pet id -> current animation's opaque bbox
 	cur         map[string]animSlot    // pet id -> animation on screen + clip end
 	pending     map[string]pendingAnim // pet id -> requested animation waiting for a free slot
@@ -389,7 +594,6 @@ type server struct {
 
 func newServer() *server {
 	s := &server{
-		pets:       map[string]*petState{"main": newPetState()},
 		windows:    map[string]*mygo.Window{},
 		winPet:     map[*mygo.Window]string{},
 		dragGen:    map[*mygo.Window]int64{},
@@ -405,6 +609,16 @@ func newServer() *server {
 		lastReload: map[string]time.Time{},
 	}
 	applyScale(s.cfg.Size)
+	s.loadPacks()
+	s.pets = make(map[string]*petState, len(s.cfg.Pets)+1)
+	for _, pc := range s.cfg.Pets {
+		s.pets[pc.ID] = newPetState(s.packOf(pc.ID).idle)
+	}
+	// HTTP consumers default to ?pet=main, so keep that state even when the
+	// user renames every configured pet.
+	if s.pets["main"] == nil {
+		s.pets["main"] = newPetState(s.builtin.idle)
+	}
 	return s
 }
 
@@ -417,7 +631,7 @@ func (s *server) addWindow(id string, w *mygo.Window) {
 	s.winPet[w] = id
 	s.pageSeen[id] = time.Now()
 	if s.pets[id] == nil {
-		s.pets[id] = newPetState()
+		s.pets[id] = newPetState(s.packOf(id).idle)
 	}
 	x, y := w.Position()
 	s.petHome[id] = [2]int{x, y}
@@ -449,13 +663,13 @@ func (s *server) setAnimLocked(id, name, playbackID string) string {
 	}
 	p := s.pets[id]
 	if p == nil {
-		p = newPetState()
+		p = newPetState(s.packOf(id).idle)
 		s.pets[id] = p
 	}
 	now := time.Now()
 	p.Anim = field{Counter: now.UnixMilli(), Data: map[string]any{"name": name, "playbackId": pid}}
 	s.playbacks[pid] = &playback{ID: pid, Pet: id, Name: name, Status: "accepted", Counter: now.UnixMilli()}
-	s.cur[id] = animSlot{name: name, pid: pid, until: now.Add(animDuration(name))}
+	s.cur[id] = animSlot{name: name, pid: pid, until: now.Add(s.packOf(id).duration(name))}
 	log.Printf("anim %s -> %s (%s)", id, name, pid)
 	return pid
 }
@@ -518,7 +732,7 @@ func (s *server) advance(id string) (kind, name string, played bool) {
 	if time.Now().Before(s.cur[id].until) {
 		return "", "", false
 	}
-	kind, name = s.pickNext()
+	kind, name = s.pickNext(id)
 	s.lastReq[id] = false
 	if kind == "move" {
 		// roam drives its own walk animations.
@@ -553,7 +767,7 @@ func (s *server) setSay(id, text string, duration int) {
 	defer s.mu.Unlock()
 	p := s.pets[id]
 	if p == nil {
-		p = newPetState()
+		p = newPetState(s.packOf(id).idle)
 		s.pets[id] = p
 	}
 	p.Say = field{Counter: time.Now().UnixMilli(), Data: map[string]any{"text": text, "duration": duration}}
@@ -565,7 +779,7 @@ func (s *server) setFacing(id, facing string) {
 	defer s.mu.Unlock()
 	p := s.pets[id]
 	if p == nil {
-		p = newPetState()
+		p = newPetState(s.packOf(id).idle)
 		s.pets[id] = p
 	}
 	p.Facing = field{Counter: time.Now().UnixMilli(), Data: facing}
@@ -604,22 +818,71 @@ func (s *server) state() fullState {
 	}
 }
 
-// config returns the animation pools under dsh-pet's config shape, so the pi
-// bridge extension's loadWorkAnims() reads a real pool and the right-click menu
-// can list animations by category.
+// config returns every pet's animation pools under dsh-pet's config shape, so
+// the pi bridge extension's loadWorkAnims() reads a real pool and each window's
+// right-click menu lists its own pack's animations by category.
 func (s *server) config() map[string]any {
-	return map[string]any{
-		"main": map[string]any{
+	out := make(map[string]any, len(s.cfg.Pets)+1)
+	for _, pc := range s.cfg.Pets {
+		p := s.packOf(pc.ID)
+		out[pc.ID] = map[string]any{
 			"animations": map[string]any{
-				"idle":    []string{idleAnim},
-				"turn":    []string{"东张西望"},
-				"moves":   roamAnims,
-				"clicks":  clickAnims,
-				"actions": s.actionPool(),
-				"events":  map[string]any{"workStatus": workStatusAnims},
+				"idle":    []string{p.idle},
+				"turn":    []string{p.turn},
+				"moves":   orEmpty(p.roam),
+				"clicks":  orEmpty(p.clicks),
+				"actions": orEmpty(p.actions),
+				"events":  map[string]any{"workStatus": mergeWorkTiers(p.work)},
 			},
-		},
+		}
 	}
+	// Contract consumers default to ?pet=main, which may have no window.
+	if _, ok := out["main"]; !ok {
+		p := s.builtin
+		out["main"] = map[string]any{
+			"animations": map[string]any{
+				"idle":    []string{p.idle},
+				"turn":    []string{p.turn},
+				"moves":   orEmpty(p.roam),
+				"clicks":  orEmpty(p.clicks),
+				"actions": orEmpty(p.actions),
+				"events":  map[string]any{"workStatus": mergeWorkTiers(p.work)},
+			},
+		}
+	}
+	return out
+}
+
+// orEmpty turns a nil pool into an empty JSON array, so consumers can always
+// treat the field as a list.
+func orEmpty(names []string) []string {
+	if names == nil {
+		return []string{}
+	}
+	return names
+}
+
+// mergeWorkTiers orders a pack's work-status clips the way dsh-pet tiers them,
+// then appends any extra tiers the pack ships under the same prefix.
+func mergeWorkTiers(found []string) []string {
+	have := make(map[string]bool, len(found))
+	for _, n := range found {
+		have[n] = true
+	}
+	out := make([]string, 0, len(found))
+	for _, n := range workStatusAnims {
+		if have[n] {
+			out = append(out, n)
+			delete(have, n)
+		}
+	}
+	for _, n := range found {
+		if have[n] {
+			out = append(out, n)
+			delete(have, n)
+		}
+	}
+	return out
 }
 
 // beginMove bumps the window's drag generation so any active fling or roam
@@ -771,14 +1034,17 @@ func (s *server) roam(id, anim string) {
 		win.SetPosition(x+dir*dist*i/steps, y)
 		time.Sleep(stepDur)
 	}
-	s.setAnim(id, idleAnim)
+	s.setAnim(id, s.packOf(id).idle)
 }
 
 // autoRoam periodically walks a pet while it is idle, until the process ends.
+// Packs without walk clips simply never roam.
 func (s *server) autoRoam(id string) {
 	for {
 		time.Sleep(time.Duration(10+rand.Intn(10)) * time.Second)
-		s.roam(id, roamAnims[rand.Intn(len(roamAnims))])
+		if roam := s.packOf(id).roam; len(roam) > 0 {
+			s.roam(id, roam[rand.Intn(len(roam))])
+		}
 	}
 }
 
@@ -802,66 +1068,27 @@ func (s *server) toggleFacing(id string) {
 	log.Printf("facing %s -> %s (turn)", id, next)
 }
 
-// isChainExcluded reports whether an animation is reserved for events or
-// interactions and should not appear in the random action pool.
-func isChainExcluded(name string) bool {
-	for _, p := range []string{"点击回应-", "工作状态-", "碎碎念-", "余额-"} {
-		if strings.HasPrefix(name, p) {
-			return true
-		}
-	}
-	switch name {
-	case idleAnim, "东张西望", "被鼠标拖拽悬空反馈", "螃蟹走路", "原地漂浮踏步", "原地左转奔跑":
-		return true
-	}
-	return false
-}
-
-var (
-	actionPoolOnce  sync.Once
-	actionPoolCache []string
-)
-
-// actionPool is the set of random-action animations, scanned once from the
-// assets dir minus the reserved idle/turn/move/clicks/events ones.
-func (s *server) actionPool() []string {
-	actionPoolOnce.Do(func() {
-		entries, err := os.ReadDir(animDir)
-		if err != nil {
-			return
-		}
-		for _, e := range entries {
-			name := e.Name()
-			if !strings.HasSuffix(name, animExt) {
-				continue
-			}
-			base := strings.TrimSuffix(name, animExt)
-			if isChainExcluded(base) {
-				continue
-			}
-			actionPoolCache = append(actionPoolCache, base)
-		}
-	})
-	return actionPoolCache
-}
-
 // pickNext chooses the next chain animation by weight: idle / turn / move /
-// random action.
-func (s *server) pickNext() (kind, name string) {
+// random action, from this pet's own pack. Packs that ship no walk or action
+// clips fall back to idle instead of asking the page for a missing file.
+func (s *server) pickNext(id string) (kind, name string) {
+	p := s.packOf(id)
 	r := rand.Intn(100)
 	switch {
 	case r < weightIdle:
-		return "idle", idleAnim
+		return "idle", p.idle
 	case r < weightIdle+weightTurn:
-		return "turn", "东张西望"
+		return "turn", p.turn
 	case r < weightIdle+weightTurn+weightMove:
-		return "move", roamAnims[rand.Intn(len(roamAnims))]
-	default:
-		pool := s.actionPool()
-		if len(pool) == 0 {
-			return "idle", idleAnim
+		if len(p.roam) == 0 {
+			return "idle", p.idle
 		}
-		return "action", pool[rand.Intn(len(pool))]
+		return "move", p.roam[rand.Intn(len(p.roam))]
+	default:
+		if len(p.actions) == 0 {
+			return "idle", p.idle
+		}
+		return "action", p.actions[rand.Intn(len(p.actions))]
 	}
 }
 
@@ -927,8 +1154,6 @@ func movDuration(path string) (float64, error) {
 	}
 	return float64(duration) / float64(timescale), nil
 }
-
-var animDurCache sync.Map // animation name -> time.Duration
 
 // EBML IDs of the WebM elements the duration lives in.
 const (
@@ -1076,34 +1301,6 @@ func webmDuration(path string) (float64, error) {
 	return seconds * float64(scale) / 1e9, nil
 }
 
-// animPath is an animation's asset file for this platform's webview.
-func animPath(name string) string {
-	return filepath.Join(animDir, name+animExt)
-}
-
-// animDuration returns the real playback length of an animation, falling back
-// to animPlaySec if the asset can't be read.
-func animDuration(name string) time.Duration {
-	if v, ok := animDurCache.Load(name); ok {
-		return v.(time.Duration)
-	}
-	var (
-		secs float64
-		err  error
-	)
-	if animExt == ".webm" {
-		secs, err = webmDuration(animPath(name))
-	} else {
-		secs, err = movDuration(animPath(name))
-	}
-	if err != nil || secs <= 0 || secs > 120 {
-		secs = float64(animPlaySec)
-	}
-	dur := time.Duration(secs * float64(time.Second))
-	animDurCache.Store(name, dur)
-	return dur
-}
-
 // animChain cycles the pet through animations: each clip plays its real length
 // and the next one is picked by weight (idle / turn / roam / random action).
 // Requested animations (work status, whispers) wait for the current clip to end
@@ -1115,7 +1312,7 @@ func (s *server) animChain(id string) {
 		if !played {
 			continue
 		}
-		log.Printf("chain %s -> %s %s (%.1fs)", id, kind, name, animDuration(name).Seconds())
+		log.Printf("chain %s -> %s %s (%.1fs)", id, kind, name, s.packOf(id).duration(name).Seconds())
 		if kind == "move" {
 			s.roam(id, name)
 			continue
@@ -1144,8 +1341,9 @@ func (s *server) whisper(id string) {
 	s.mu.Lock()
 	s.lastWhisper = line
 	s.mu.Unlock()
-	anim := whisperAnims[rand.Intn(len(whisperAnims))]
-	s.requestAnim(id, anim)
+	if anims := s.packOf(id).whispers; len(anims) > 0 {
+		s.requestAnim(id, anims[rand.Intn(len(anims))])
+	}
 	s.setSay(id, line, 6000)
 }
 
@@ -1235,7 +1433,16 @@ func (p *Pet) Click(ctx context.Context) {
 	if id == "" {
 		id = "main"
 	}
-	p.server.setAnim(id, clickAnims[rand.Intn(len(clickAnims))])
+	pack := p.server.packOf(id)
+	pool := pack.clicks
+	if len(pool) == 0 {
+		pool = pack.actions // no dedicated reactions: any clip is feedback
+	}
+	if len(pool) > 0 {
+		p.server.setAnim(id, pool[rand.Intn(len(pool))])
+	} else {
+		p.server.setAnim(id, pack.idle)
+	}
 	// A click is instant feedback: it preempts the current clip and counts as
 	// the request turn, so the chain gets the next random pick.
 	p.server.markRequestPlayed(id)
@@ -1517,6 +1724,25 @@ func (s *server) handler() http.Handler {
 		}
 		go s.throw(petOf(r), body.Power, body.Angle)
 		jsonReply(w, map[string]bool{"ok": true})
+	}))
+
+	// Assets are served over HTTP, not file://: a custom pack lives outside the
+	// page's directory, and one endpoint keeps name->path mapping in Go. The
+	// name is a bare clip name, never a path.
+	mux.HandleFunc("/dsh-pet-7340/asset", cors(func(w http.ResponseWriter, r *http.Request) {
+		name := r.URL.Query().Get("name")
+		if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
+			http.Error(w, "invalid name", http.StatusBadRequest)
+			return
+		}
+		pack := s.packOf(petOf(r))
+		path := pack.path(name)
+		if st, err := os.Stat(path); err != nil || st.IsDir() {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", pack.contentType())
+		http.ServeFile(w, r, path) // handles Range/If-Modified-Since for <video>
 	}))
 
 	mux.HandleFunc("/health", cors(func(w http.ResponseWriter, r *http.Request) {

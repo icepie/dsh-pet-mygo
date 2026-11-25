@@ -29,16 +29,19 @@ VP9-alpha webm（Linux WebKitGTK，实测 X11 + picom），因此整个桌宠可
   无缓存时用内置句子池降级。宠物运行时**不调模型**，批量生成一次能用很久
 - **屏幕漫游 + 朝向镜像**：朝随机方向行走不走出屏幕，朝左时视频水平翻转
 - **多显示器**：漫游与抛掷按窗口所在的显示器计算边界（`Screen.DisplayMatching`）
-- **单元测试**：18 个测试覆盖 moov/EBML 时长解析、动画链权重、契约端点、配置读写（`go test ./...`）
+- **单元测试**：moov/EBML 时长解析、动画链权重、契约端点、配置读写、pet pack 隔离（`go test ./...`）
 - **多宠物 / 多窗口**：每只宠物独立窗口、独立状态与气泡，bridge 用 `CallerWindow` 区分
+- **多宠物种类（pet pack）**：`pets[].pack` 选种类，每个种类独立动画池与素材目录，
+  菜单、随机动作、点击/碎碎念都只在本种类里挑；缺素材时记日志并回退内置种类，不拖垮其他窗口
 - `/dsh-pet-7340` 契约端点：`GET /state`、`GET /config`、`POST /anim`（回 `playbackId`）、
   `GET /playback/{id}`（播放回执，状态含 `queued`）、`POST /playback/{id}/report`、`POST /whisper`、
-  `POST /broadcast`、`POST /position`（归一化坐标）、`POST /throw`（抛掷+反弹+摩擦），
-  均按 `?pet=` 路由
+  `POST /broadcast`、`POST /position`（归一化坐标）、`POST /throw`（抛掷+反弹+摩擦）、
+  `GET /asset?name=`（按 `?pet=` 交给对应种类的素材文件，支持 Range），均按 `?pet=` 路由
 - 状态结构与 dsh-pet 一致（`pets.<id>.{say,anim,facing} = {counter, data}`），
   因此之前写的 [pi 桥接扩展](../../.pi/agent/extensions/dsh-pet.ts) **零改动**直接可用
-- 106 个动画素材，两套格式：HEVC-alpha mov（macOS，134MB）与 VP9-alpha webm
-  （Linux/Windows，56MB），页面按平台选目录与扩展名
+- 内置种类 106 个动画素材，两套格式：HEVC-alpha mov（macOS，134MB）与 VP9-alpha webm
+  （Linux/Windows，56MB），页面按平台选目录与扩展名；素材由宿主经 `/asset` 提供，
+  自定义种类可以放在 `resources/` 之外
 
 ## 平台支持
 
@@ -110,9 +113,9 @@ Linux 运行依赖：
 **本项目的优势**：零依赖零下载（不用等 Electron 116MB）、单二进制分发、代码量 1/20
 （删掉了 DSH 宿主的 15k 行路由/事件/helper 进程管理/多屏坐标）、内存省一半以上。
 
-**原版仍占优的地方**（如实列出）：余额动画 / 对话聊天 / 系统通知 / pet pack
-（本项目降级或未做，缺模型与余额源）、素材更小（webm 52MB vs mov 134MB）、
-多宿主生态与正式发布积累。
+**原版仍占优的地方**（如实列出）：余额动画 / 对话聊天 / 系统通知（缺模型与余额源）、
+pet pack 的配置深度（原版每个种类可写独立权重、sleep 三段、人设；本项目只有
+素材目录 + 按名字分池）、素材更小（webm 52MB vs mov 134MB）、多宿主生态与正式发布积累。
 
 一句话：用 1/20 代码、1/25 体积实现约 80% 的核心桌宠体验，剩下的 20% 是依赖
 外部凭证的能力与细节打磨。
@@ -153,17 +156,49 @@ curl -s -X POST 'http://127.0.0.1:3080/dsh-pet-7340/broadcast?pet=main' \
 {
   "size": 0.7,
   "pets": [
-    { "id": "main", "x": 700, "y": 220 }
+    { "id": "main", "x": 700, "y": 220 },
+    { "id": "cat1", "pack": "cat", "x": 300, "y": 120 }
   ]
 }
 ```
 
 - `size`：整体缩放比例（0.3~2.0，1 = 原生 640×360 画布，默认 0.7），窗口与命中区同步缩放。
 - `pets`：每个元素一只宠物、一个独立窗口（`id` 不同即可多开）。
+- `pack`：宠物种类，省略 = 内置蓝毛女仆；写名字则用 `pets/<名字>/` 下的素材（见下节）。
 - `x` / `y`：窗口左上角的逻辑屏幕坐标。
 
 > 注：macOS 上 MyGo 创建窗口时的 `X` 在小于约 221 时会被 AppKit clamp，所以本项目在
 > 创建后用 `SetPosition` 显式定位，配置里的任意坐标都能生效。
+
+### 换宠物（pet pack）
+
+一个种类 = 配置里 `pack` 的一个值 + 一个素材目录，放在配置文件旁边：
+
+```
+~/.config/dsh-pet-mygo/
+├─ config.json
+└── pets/
+    └── cat/
+        ├── anim/*.mov        ← macOS（WKWebView）
+        └── anim-webm/*.webm  ← Linux / Windows（WebKitGTK、WebView2）
+```
+
+```json
+{ "id": "cat1", "pack": "cat", "x": 300, "y": 120 }
+```
+
+- 同 `pack` 的多只宠物共用一份素材与动画池，各自独立窗口、状态、气泡。
+- **文件名决定用途**（与 dsh-pet 一致），种类只补自己需要的：
+  - `待机呼吸休闲` → 待机循环；没有它时取第一个含「待机」的片段，再没有就取排序第一个。
+  - `东张西望` → 转向；`螃蟹走路` / `原地漂浮踏步` / `原地左转奔跑` → 漫游（没有则不漫游）。
+  - `点击回应-*` → 点击回应；`碎碎念-*` → 碎碎念；`工作状态-*` → 供 `/config` 消费方读的档位池；
+    `余额-*` → 预留，不进随机池。
+  - 其余片段自动进随机动作池。
+- 素材规格不变：640×360 画布、带 alpha；按平台放对应格式，页面只播当前平台那一套。
+- 少于 4 个池子不会报错：缺 `点击回应-*` 用随机动作代替，缺 `碎碎念-*` 只弹气泡不换动画。
+- `pack` 目录不存在或没有素材文件时，**启动日志会点名**（`pack "cat" unusable for pet cat1 (...)`），
+  该宠物回退内置种类继续跑，其他窗口不受影响。
+- 改 `pack` 需要重启（每个窗口启动时绑定自己的种类）。
 
 ### 碎碎念句子（批量预生成）
 
@@ -184,14 +219,15 @@ DSH_PET_LLM_MODEL=gpt-4o-mini \
 ## 架构
 
 ```
-main.go                    透明窗 + /dsh-pet-7340 HTTP 服务 + 内存状态
-resources/index.html       <video> 播放 mov，轮询 /state 切换动画 + 气泡
-resources/anim/*.mov       HEVC-alpha 透明素材
+main.go                    透明窗 + /dsh-pet-7340 HTTP 服务 + 内存状态 + pet pack 扫描
+resources/index.html       双缓冲 <video>，轮询 /state 切换动画 + 气泡 + 右键菜单
+resources/anim/*.mov       HEVC-alpha 透明素材（内置种类，macOS）
+resources/anim-webm/*.webm VP9-alpha 透明素材（内置种类，Linux/Windows）
 scripts/encode-movs.sh     webm(VP9-alpha) → mov(HEVC-alpha) 转码
 ```
 
 - 页面通过 `file://` 加载，`fetch` 到 HTTP 服务属跨域，服务端已加 CORS 头。
-- 动画名即 `resources/anim/` 下的文件名（不含扩展名）。
+- 动画名即素材目录下的文件名（不含扩展名），视频统一走 `GET /asset?pet=&name=`。
 
 ## 素材：webm → HEVC-alpha mov
 
