@@ -226,7 +226,8 @@ resources/anim-webm/*.webm VP9-alpha 透明素材（内置种类，Linux/Windows
 scripts/encode-movs.sh     webm(VP9-alpha) → mov(HEVC-alpha) 转码
 ```
 
-- 页面通过 `file://` 加载，`fetch` 到 HTTP 服务属跨域，服务端已加 CORS 头。
+- 页面由同一个 HTTP 服务在 `/` 提供（不再是 `file://`），所以页面同源、端口只写在 Go 的
+  `listenAddr` 一处；CORS 头仍保留给 pi 桥接扩展等外部调用方。
 - 动画名即素材目录下的文件名（不含扩展名），视频统一走 `GET /asset?pet=&name=`。
 
 ## 素材：webm → HEVC-alpha mov

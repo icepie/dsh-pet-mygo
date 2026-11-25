@@ -526,3 +526,38 @@ func TestConfigLoadDoesNotMutateDefaults(t *testing.T) {
 		t.Fatalf("defaults mutated by a config load: %+v", defaultPets)
 	}
 }
+
+// TestPageServedFromHost: the window loads "/" for its page, so the host must
+// serve it and must not answer other paths with it (clips go through /asset).
+func TestPageServedFromHost(t *testing.T) {
+	s := testServer(t)
+	srv := httptest.NewServer(s.handler())
+	defer srv.Close()
+
+	for _, path := range []string{"/", "/index.html"} {
+		resp, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("%s = %d, want 200", path, resp.StatusCode)
+		}
+		if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+			t.Errorf("%s content-type = %q", path, ct)
+		}
+		if !bytes.Contains(body, []byte("id=\"stage\"")) {
+			t.Errorf("%s did not return the pet page", path)
+		}
+	}
+
+	resp, err := http.Get(srv.URL + "/does-not-exist")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("unknown path = %d, want 404", resp.StatusCode)
+	}
+}

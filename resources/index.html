@@ -99,7 +99,13 @@
     <div id="menu"></div>
   </div>
   <script>
-    const BASE = "http://127.0.0.1:3080/dsh-pet-7340";
+    // The window loads this page from the pet's own server, so its origin is the
+    // host: the API port is never duplicated here. The file:// branch only
+    // covers opening index.html by hand.
+    const BASE =
+      location.protocol === "file:"
+        ? "http://127.0.0.1:3080/dsh-pet-7340"
+        : location.origin + "/dsh-pet-7340";
     // The pack's idle clip; /config names it at boot (a custom pack may call its
     // idle anything).
     let idleName = "待机呼吸休闲";

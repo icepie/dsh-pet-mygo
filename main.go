@@ -1572,7 +1572,8 @@ func (s *server) persistLoop() {
 func (s *server) handler() http.Handler {
 	mux := http.NewServeMux()
 
-	// The page is loaded over file://, so its fetches are cross-origin.
+	// The window's page is same-origin now, but the pi bridge extension and
+	// other consumers call from their own origin, so keep CORS open.
 	cors := func(h http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -1726,6 +1727,19 @@ func (s *server) handler() http.Handler {
 		jsonReply(w, map[string]bool{"ok": true})
 	}))
 
+	// The window loads the pet page from this server, so the page and the API
+	// share an origin and the page needs no hardcoded port. Only "/" is served:
+	// clips go through /asset, never a directory listing.
+	mux.HandleFunc("/", cors(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" && r.URL.Path != "/index.html" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		http.ServeFile(w, r, filepath.Join("resources", "index.html"))
+	}))
+
 	// Assets are served over HTTP, not file://: a custom pack lives outside the
 	// page's directory, and one endpoint keeps name->path mapping in Go. The
 	// name is a bare clip name, never a path.
@@ -1819,12 +1833,20 @@ func main() {
 	s := newServer()
 	mygo.Bind(&Pet{server: s})
 	go s.persistLoop()
+	// Bind before the windows load their page: the page comes from this server,
+	// so the port must accept connections first. It also gives the page a real
+	// origin to derive API URLs from, so the port lives in one place only.
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		log.Fatalf("http listen: %v", err)
+	}
 	go func() {
-		log.Printf("serving /dsh-pet-7340 on http://%s", listenAddr)
-		if err := http.ListenAndServe(listenAddr, s.handler()); err != nil {
+		log.Printf("serving pet page and /dsh-pet-7340 on http://%s", listenAddr)
+		if err := http.Serve(ln, s.handler()); err != nil {
 			log.Fatalf("http server: %v", err)
 		}
 	}()
+	pageURL := "http://" + listenAddr + "/"
 
 	mygo.App.WhenReady(func() {
 		for _, pc := range s.cfg.Pets {
@@ -1861,7 +1883,7 @@ func main() {
 			// Take the mouse on the pet's body only; the page narrows this to
 			// the live animation's opaque pixels as it plays.
 			s.applyInputRegion(win, pc.ID)
-			if err := win.Page().LoadFile("resources/index.html"); err != nil {
+			if err := win.Page().LoadURL(pageURL); err != nil {
 				log.Fatalf("load pet page: %v", err)
 			}
 			// MyGo reports a dead web content process but leaves the window blank,
