@@ -74,7 +74,10 @@ Linux 运行依赖：
   `auto` 只在 Wayland + 非 NVIDIA/虚拟机/容器时打开。本机 X11 + AMD 实测：
   关闭 10.8% CPU → 打开 8.1%（20 秒总进程采样），透明和 alpha 均正常。
 - **窗口混合**：由桌面合成器负责。picom 默认 `xrender` 后端是 CPU 合成，改成
-  `backend = "glx"` 才走 GPU；KWin/Mutter 默认已是 GPU。
+  `backend = "glx"` 才走 GPU；KWin/Mutter 默认已是 GPU。合成器会把透明窗当成整个矩形
+  投影，看起来像一圈边框：可以在 picom 的 `rules` 里只排除宠物
+  `{ match = "name = 'dsh-pet' || class_g = 'Dsh-pet-mygo-linux'"; shadow = false; }`，
+  也可以让整个桌面无阴影（`shadow = false`）。
 - macOS 走 VideoToolbox 硬解 + CoreAnimation 合成，无需开关。
 
 ## 与原版对比
