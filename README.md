@@ -63,6 +63,20 @@ Linux 运行依赖：
 命中区按当前动画的透明像素动态更新；右键菜单打开时临时放大到整窗。macOS / Windows
 由 MyGo 轮询指针切换。页面按 `mygo.platform` 选择 `anim/`+`.mov` 或 `anim-webm/`+`.webm`。
 
+## 硬件加速
+
+- **视频解码**：GStreamer 按 rank 自动选解码器。装了 VA-API 且驱动支持时选
+  `vavp9alphadecodebin`（rank 267，硬解 VP9-alpha，输出 AV12），否则回退软件
+  `vp9alphadecodebin`（rank 266）。本机（AMD RX 7700 XT）实测 `decodebin` 选中的是
+  VA-API 硬解。
+- **页面合成**：MyGo 默认关闭 WebKitGTK 的 DMA-BUF renderer（NVIDIA、虚拟机、容器里会
+  白屏），此时页面合成走 CPU。GPU 主机可以 `DSH_PET_DMABUF=on` 交给 WebKit 自己决定；
+  `auto` 只在 Wayland + 非 NVIDIA/虚拟机/容器时打开。本机 X11 + AMD 实测：
+  关闭 10.8% CPU → 打开 8.1%（20 秒总进程采样），透明和 alpha 均正常。
+- **窗口混合**：由桌面合成器负责。picom 默认 `xrender` 后端是 CPU 合成，改成
+  `backend = "glx"` 才走 GPU；KWin/Mutter 默认已是 GPU。
+- macOS 走 VideoToolbox 硬解 + CoreAnimation 合成，无需开关。
+
 ## 与原版对比
 
 实测数据（macOS arm64，`du` / `ps` / `wc`）：

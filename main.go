@@ -1545,23 +1545,20 @@ func removeWMBorder() {
 	binary.LittleEndian.PutUint32(msg[6:], uint32(len(payload)))
 	binary.LittleEndian.PutUint32(msg[10:], 0) // RUN_COMMAND
 	msg = append(msg, payload...)
-	// The window may not be managed yet when it is created; retry briefly
-	// until i3 confirms the command matched and ran.
-	for range 5 {
+	// The window is not managed yet when it is created, and i3 answers
+	// success for a command that matched no window, so repeat it for a few
+	// seconds after the window is up.
+	for range 6 {
 		conn, err := net.DialTimeout("unix", sock, 500*time.Millisecond)
 		if err != nil {
 			return
 		}
 		conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
-		if _, err := conn.Write(msg); err == nil {
-			buf := make([]byte, 4096)
-			if n, _ := conn.Read(buf); n >= 14 && strings.Contains(string(buf[:n]), `"success":true`) {
-				conn.Close()
-				return
-			}
-		}
+		_, _ = conn.Write(msg)
+		buf := make([]byte, 512)
+		_, _ = conn.Read(buf)
 		conn.Close()
-		time.Sleep(300 * time.Millisecond)
+		time.Sleep(900 * time.Millisecond)
 	}
 }
 
@@ -1580,6 +1577,18 @@ func main() {
 	// icon (and the folder placeholder a raw binary gets) with the accessory
 	// activation policy. Windows still show.
 	mygo.App.SetActivationPolicy(mygo.ActivationPolicyAccessory)
+
+	// MyGo turns WebKitGTK's DMA-BUF renderer off by default: it draws blank
+	// windows on NVIDIA, in VMs and in containers. On a GPU host it can put
+	// page compositing back on the GPU, at the cost of that compatibility.
+	if runtime.GOOS == "linux" {
+		switch strings.ToLower(os.Getenv("DSH_PET_DMABUF")) {
+		case "on":
+			mygo.App.SetDMABUFRenderer(mygo.DMABUFRendererOn)
+		case "auto":
+			mygo.App.SetDMABUFRenderer(mygo.DMABUFRendererAuto)
+		}
+	}
 
 	s := newServer()
 	mygo.Bind(&Pet{server: s})
