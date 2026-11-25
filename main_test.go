@@ -30,7 +30,7 @@ func TestMovDuration(t *testing.T) {
 		{"螃蟹走路", 10.04},
 	}
 	for _, c := range cases {
-		got, err := movDuration(filepath.Join(animDir, c.name+".mov"))
+		got, err := movDuration(filepath.Join(movAnimDir, c.name+".mov"))
 		if err != nil {
 			t.Fatalf("%s: %v", c.name, err)
 		}
@@ -41,13 +41,39 @@ func TestMovDuration(t *testing.T) {
 }
 
 func TestMovDurationMissingFile(t *testing.T) {
-	if _, err := movDuration(filepath.Join(animDir, "does-not-exist.mov")); err == nil {
+	if _, err := movDuration(filepath.Join(movAnimDir, "does-not-exist.mov")); err == nil {
+		t.Fatal("expected an error for a missing file")
+	}
+}
+
+func TestWebmDuration(t *testing.T) {
+	cases := []struct {
+		name string
+		want float64
+	}{
+		{"待机呼吸休闲", 10.04},
+		{"工作状态-垂头叹气冒汗", 4.92},
+		{"螃蟹走路", 10.04},
+	}
+	for _, c := range cases {
+		got, err := webmDuration(filepath.Join(webmAnimDir, c.name+".webm"))
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if math.Abs(got-c.want) > 0.1 {
+			t.Errorf("%s: got %.2fs, want %.2fs", c.name, got, c.want)
+		}
+	}
+}
+
+func TestWebmDurationMissingFile(t *testing.T) {
+	if _, err := webmDuration(filepath.Join(webmAnimDir, "does-not-exist.webm")); err == nil {
 		t.Fatal("expected an error for a missing file")
 	}
 }
 
 func TestFindAtomNested(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join(animDir, "待机呼吸休闲.mov"))
+	data, err := os.ReadFile(filepath.Join(movAnimDir, "待机呼吸休闲.mov"))
 	if err != nil {
 		t.Skipf("asset not present: %v", err)
 	}

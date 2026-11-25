@@ -15,9 +15,11 @@ import (
 	"log"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -26,11 +28,12 @@ import (
 )
 
 const (
-	listenAddr = "127.0.0.1:3080"
-	idleAnim   = "待机呼吸休闲"
-	baseW      = 640 // animation canvas
-	baseH      = 360
-	animDir    = "resources/anim"
+	listenAddr  = "127.0.0.1:3080"
+	idleAnim    = "待机呼吸休闲"
+	baseW       = 640 // animation canvas
+	baseH       = 360
+	movAnimDir  = "resources/anim"      // HEVC-with-alpha .mov (WKWebView)
+	webmAnimDir = "resources/anim-webm" // VP9-with-alpha .webm (WebKitGTK, WebView2)
 
 	// petHit* is the pet body region (in canvas coords) used as the fallback
 	// click-through box; everything else in the window passes clicks through.
@@ -43,6 +46,11 @@ const (
 // windowW/H and the fallback hit box are derived from the config scale at
 // startup (see applyScale), so the whole canvas scales together.
 var (
+	// Windows' WKWebView plays HEVC-with-alpha .mov; WebKitGTK and WebView2
+	// play VP9-with-alpha .webm. Pick the set the platform's webview decodes.
+	animDir = movAnimDir
+	animExt = ".mov"
+
 	windowW = baseW
 	windowH = baseH
 	hitMinX = petHitMinX
@@ -50,6 +58,13 @@ var (
 	hitMaxX = petHitMaxX
 	hitMaxY = petHitMaxY
 )
+
+func init() {
+	if runtime.GOOS != "darwin" {
+		animDir = webmAnimDir
+		animExt = ".webm"
+	}
+}
 
 // applyScale sizes the window (and the fallback hit box) to the canvas times
 // the config scale, clamped to a sane range.
@@ -269,7 +284,7 @@ func configPath() string {
 // loadConfig reads the user config, falling back to defaults. On first run it
 // writes a default file so the user has something to edit.
 func loadConfig() appConfig {
-	cfg := appConfig{Size: 1, Pets: defaultPets}
+	cfg := appConfig{Size: 0.7, Pets: defaultPets}
 	data, err := os.ReadFile(configPath())
 	if err != nil {
 		saveConfig(cfg)
@@ -277,7 +292,7 @@ func loadConfig() appConfig {
 	}
 	if err := json.Unmarshal(data, &cfg); err != nil || len(cfg.Pets) == 0 {
 		log.Printf("config %s invalid, using defaults", configPath())
-		cfg = appConfig{Size: 1, Pets: defaultPets}
+		cfg = appConfig{Size: 0.7, Pets: defaultPets}
 	}
 	if cfg.Size <= 0 {
 		cfg.Size = 1
@@ -817,10 +832,10 @@ func (s *server) actionPool() []string {
 		}
 		for _, e := range entries {
 			name := e.Name()
-			if !strings.HasSuffix(name, ".mov") {
+			if !strings.HasSuffix(name, animExt) {
 				continue
 			}
-			base := strings.TrimSuffix(name, ".mov")
+			base := strings.TrimSuffix(name, animExt)
 			if isChainExcluded(base) {
 				continue
 			}
@@ -915,13 +930,172 @@ func movDuration(path string) (float64, error) {
 
 var animDurCache sync.Map // animation name -> time.Duration
 
+// EBML IDs of the WebM elements the duration lives in.
+const (
+	ebmlSegment       = 0x18538067
+	ebmlInfo          = 0x1549A966
+	ebmlTimecodeScale = 0x2AD7B1
+	ebmlDuration      = 0x4489
+)
+
+// ebmlID reads an element ID (1-4 bytes) including its length marker.
+func ebmlID(b []byte) (id uint64, n int) {
+	if len(b) == 0 || b[0] == 0 {
+		return 0, 0
+	}
+	n = 1
+	for mask := byte(0x80); b[0]&mask == 0; mask >>= 1 {
+		n++
+	}
+	if n > 4 || len(b) < n {
+		return 0, 0
+	}
+	for i := range n {
+		id = id<<8 | uint64(b[i])
+	}
+	return id, n
+}
+
+// ebmlSize reads a size VINT, returning its value, its encoded length, and
+// whether the element has an unknown size.
+func ebmlSize(b []byte) (size uint64, n int, unknown bool, ok bool) {
+	if len(b) == 0 || b[0] == 0 {
+		return 0, 0, false, false
+	}
+	n = 1
+	for mask := byte(0x80); b[0]&mask == 0; mask >>= 1 {
+		n++
+	}
+	if n > 8 || len(b) < n {
+		return 0, 0, false, false
+	}
+	size = uint64(b[0] & (0xFF >> n))
+	for i := 1; i < n; i++ {
+		size = size<<8 | uint64(b[i])
+	}
+	// All value bits set means the element's size is not known.
+	unknown = size == (uint64(1)<<(7*n))-1
+	return size, n, unknown, true
+}
+
+// ebmlElements walks the elements at one level, stopping when fn returns false.
+func ebmlElements(data []byte, fn func(id uint64, body []byte) bool) {
+	for len(data) > 0 {
+		id, idn := ebmlID(data)
+		if idn == 0 {
+			return
+		}
+		size, szn, unknown, ok := ebmlSize(data[idn:])
+		if !ok {
+			return
+		}
+		start := idn + szn
+		var body []byte
+		if unknown {
+			body = data[start:]
+		} else {
+			if size > uint64(len(data)-start) {
+				return
+			}
+			body = data[start : start+int(size)]
+			data = data[start+int(size):]
+		}
+		if !fn(id, body) {
+			return
+		}
+		if unknown {
+			return
+		}
+	}
+}
+
+// ebmlFind returns the payload of the first child element with the given ID.
+func ebmlFind(data []byte, want uint64) ([]byte, bool) {
+	var out []byte
+	found := false
+	ebmlElements(data, func(id uint64, body []byte) bool {
+		if id == want {
+			out, found = body, true
+			return false
+		}
+		return true
+	})
+	return out, found
+}
+
+// ebmlUint reads a big-endian unsigned integer payload (up to 8 bytes).
+func ebmlUint(b []byte) uint64 {
+	var v uint64
+	if len(b) > 8 {
+		b = b[len(b)-8:]
+	}
+	for _, c := range b {
+		v = v<<8 | uint64(c)
+	}
+	return v
+}
+
+// webmDuration reads a WebM's duration from Segment > Info > Duration, which
+// is in TimecodeScale units (1ms by default), so the animation chain can wait
+// for the real clip length on WebKitGTK and WebView2 too.
+func webmDuration(path string) (float64, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	segment, ok := ebmlFind(data, ebmlSegment)
+	if !ok {
+		return 0, errors.New("no Segment element")
+	}
+	info, ok := ebmlFind(segment, ebmlInfo)
+	if !ok {
+		return 0, errors.New("no Info element")
+	}
+	scale := uint64(1_000_000) // nanoseconds per timecode unit
+	if raw, ok := ebmlFind(info, ebmlTimecodeScale); ok {
+		if v := ebmlUint(raw); v > 0 {
+			scale = v
+		}
+	}
+	raw, ok := ebmlFind(info, ebmlDuration)
+	if !ok {
+		return 0, errors.New("no Duration element")
+	}
+	var seconds float64
+	switch len(raw) {
+	case 4:
+		seconds = float64(math.Float32frombits(binary.BigEndian.Uint32(raw)))
+	case 8:
+		seconds = math.Float64frombits(binary.BigEndian.Uint64(raw))
+	default:
+		return 0, errors.New("bad Duration element")
+	}
+	if seconds <= 0 {
+		return 0, errors.New("zero duration")
+	}
+	return seconds * float64(scale) / 1e9, nil
+}
+
+// animPath is an animation's asset file for this platform's webview.
+func animPath(name string) string {
+	return filepath.Join(animDir, name+animExt)
+}
+
 // animDuration returns the real playback length of an animation, falling back
-// to animPlaySec if the mov can't be read.
+// to animPlaySec if the asset can't be read.
 func animDuration(name string) time.Duration {
 	if v, ok := animDurCache.Load(name); ok {
 		return v.(time.Duration)
 	}
-	secs, err := movDuration(filepath.Join(animDir, name+".mov"))
+	var (
+		secs float64
+		err  error
+	)
+	if animExt == ".webm" {
+		secs, err = webmDuration(animPath(name))
+	} else {
+		secs, err = movDuration(animPath(name))
+	}
 	if err != nil || secs <= 0 || secs > 120 {
 		secs = float64(animPlaySec)
 	}
@@ -1085,26 +1259,27 @@ func (p *Pet) Home(ctx context.Context) {
 	w.SetPosition(home[0], home[1])
 }
 
-// SetMenuOpen tells the click-through loop the right-click menu is open, so
+// SetMenuOpen tells the input-region loop the right-click menu is open, so
 // the whole window keeps receiving the mouse while the user picks an item.
 func (p *Pet) SetMenuOpen(ctx context.Context, open bool) {
 	w := mygo.CallerWindow(ctx)
 	p.server.mu.Lock()
 	p.server.menuOpen[w] = open
 	p.server.mu.Unlock()
+	p.server.applyInputRegion(w, p.server.petID(w))
 }
 
-// SetHitBox tells the click-through loop the pet's opaque region for the
-// current animation (canvas coords), so the transparent margin passes clicks
+// SetHitBox tells the input-region loop the pet's opaque region for the
+// current animation (window coords), so the transparent margin passes clicks
 // through instead of the fixed fallback box.
 func (p *Pet) SetHitBox(ctx context.Context, minX, minY, maxX, maxY int) {
 	w := mygo.CallerWindow(ctx)
 	s := p.server
+	id := s.petID(w)
 	s.mu.Lock()
-	if id := s.winPet[w]; id != "" {
-		s.hitBox[id] = [4]int{minX, minY, maxX, maxY}
-	}
+	s.hitBox[id] = [4]int{minX, minY, maxX, maxY}
 	s.mu.Unlock()
+	s.applyInputRegion(w, id)
 }
 
 // Fling throws the calling window with an initial velocity (px/s), from a drag
@@ -1114,38 +1289,42 @@ func (p *Pet) Fling(ctx context.Context, vx, vy float64) {
 	p.server.fling(mygo.CallerWindow(ctx), vx, vy)
 }
 
-// clickThroughLoop makes the window ignore the mouse everywhere except over
-// the pet's body, so the transparent margin never blocks clicks on windows
-// underneath. It polls the cursor (the window cannot see mouse moves while it
-// ignores them) and flips SetIgnoreMouseEvents only on a state change.
-func (s *server) clickThroughLoop(id string) {
-	win := s.windowFor(id)
-	if win == nil {
+// petID returns the pet id of a window, falling back to "main".
+func (s *server) petID(w *mygo.Window) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if id, ok := s.winPet[w]; ok {
+		return id
+	}
+	return "main"
+}
+
+// applyInputRegion limits the window's mouse-taking area to the pet's opaque
+// box, or the whole window while the context menu is open. Linux applies it as
+// the window's input shape (X11 SHAPE, Wayland wl_surface input region);
+// macOS and Windows poll the pointer in MyGo. Everything outside passes clicks
+// through to the desktop, so the transparent margin never blocks other apps.
+func (s *server) applyInputRegion(w *mygo.Window, id string) {
+	if w == nil {
 		return
 	}
-	ignoring := true
-	win.SetIgnoreMouseEvents(true)
-	for {
-		wx, wy := win.Position()
-		cur := mygo.Screen.CursorScreenPoint()
-		s.mu.Lock()
-		menuOpen := s.menuOpen[win]
-		hb, hasHB := s.hitBox[id]
-		s.mu.Unlock()
-		minX, minY, maxX, maxY := hitMinX, hitMinY, hitMaxX, hitMaxY
-		if hasHB {
-			minX, minY, maxX, maxY = hb[0], hb[1], hb[2], hb[3]
-		}
-		inPet := cur.X >= wx+minX && cur.X <= wx+maxX &&
-			cur.Y >= wy+minY && cur.Y <= wy+maxY
-		wantIgnore := !(inPet || menuOpen)
-		if wantIgnore != ignoring {
-			win.SetIgnoreMouseEvents(wantIgnore)
-			ignoring = wantIgnore
-			log.Printf("click-through %s -> ignore=%v", id, ignoring)
-		}
-		time.Sleep(30 * time.Millisecond)
+	s.mu.Lock()
+	menuOpen := s.menuOpen[w]
+	minX, minY, maxX, maxY := hitMinX, hitMinY, hitMaxX, hitMaxY
+	if hb, ok := s.hitBox[id]; ok {
+		minX, minY, maxX, maxY = hb[0], hb[1], hb[2], hb[3]
 	}
+	s.mu.Unlock()
+	if menuOpen {
+		w.SetInputRegion([]mygo.Rectangle{{Width: windowW, Height: windowH}})
+		return
+	}
+	w.SetInputRegion([]mygo.Rectangle{{
+		X:      minX,
+		Y:      minY,
+		Width:  maxX - minX,
+		Height: maxY - minY,
+	}})
 }
 
 // savePositions writes current window positions back to the config if they
@@ -1347,6 +1526,45 @@ func (s *server) handler() http.Handler {
 	return mux
 }
 
+// removeWMBorder asks i3/sway to drop the border they draw around floating
+// windows. A tiling WM decorates every floating window, a utility panel too,
+// and no EWMH hint opts a window out of it; a desktop pet must not sit in a
+// focus-colored box. I3SOCK/SWAYSOCK are set by the WM for the processes it
+// starts, so this does nothing under other window managers.
+func removeWMBorder() {
+	sock := os.Getenv("I3SOCK")
+	if sock == "" {
+		sock = os.Getenv("SWAYSOCK")
+	}
+	if sock == "" {
+		return
+	}
+	payload := []byte(`[title="^dsh-pet$"] border none`)
+	msg := make([]byte, 14, 14+len(payload))
+	copy(msg, "i3-ipc")
+	binary.LittleEndian.PutUint32(msg[6:], uint32(len(payload)))
+	binary.LittleEndian.PutUint32(msg[10:], 0) // RUN_COMMAND
+	msg = append(msg, payload...)
+	// The window may not be managed yet when it is created; retry briefly
+	// until i3 confirms the command matched and ran.
+	for range 5 {
+		conn, err := net.DialTimeout("unix", sock, 500*time.Millisecond)
+		if err != nil {
+			return
+		}
+		conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
+		if _, err := conn.Write(msg); err == nil {
+			buf := make([]byte, 4096)
+			if n, _ := conn.Read(buf); n >= 14 && strings.Contains(string(buf[:n]), `"success":true`) {
+				conn.Close()
+				return
+			}
+		}
+		conn.Close()
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
 func main() {
 	genWhispers := flag.Bool("generate-whispers", false, "generate whisper lines via the configured LLM and exit")
 	whisperCount := flag.Int("whisper-count", 30, "how many whisper lines to generate")
@@ -1382,7 +1600,7 @@ func main() {
 			wa := d.WorkArea
 			pc.X = min(max(pc.X, wa.X), wa.X+wa.Width-windowW)
 			pc.Y = min(max(pc.Y, wa.Y), wa.Y+wa.Height-windowH)
-			win := mygo.NewWindow(mygo.WindowOptions{
+			opts := mygo.WindowOptions{
 				Title:         "dsh-pet",
 				Width:         windowW,
 				Height:        windowH,
@@ -1393,11 +1611,21 @@ func main() {
 				AlwaysOnTop:   true,
 				SkipTaskbar:   true,
 				DisableShadow: true,
-			})
+			}
+			if runtime.GOOS == "linux" {
+				// A GTK utility window: tiling WMs (i3, sway) keep it floating
+				// instead of stretching it across a tile, and it stays on every
+				// workspace as a desktop pet should.
+				opts.Panel = true
+			}
+			win := mygo.NewWindow(opts)
 			// MyGo's create-time X is clamped by AppKit for small values, so
 			// place the window explicitly after creation.
 			win.SetPosition(pc.X, pc.Y)
 			s.addWindow(pc.ID, win)
+			// Take the mouse on the pet's body only; the page narrows this to
+			// the live animation's opaque pixels as it plays.
+			s.applyInputRegion(win, pc.ID)
 			if err := win.Page().LoadFile("resources/index.html"); err != nil {
 				log.Fatalf("load pet page: %v", err)
 			}
@@ -1410,8 +1638,10 @@ func main() {
 			})
 			go s.animChain(pc.ID)
 			go s.whisperLoop(pc.ID)
-			go s.clickThroughLoop(pc.ID)
 			go s.pageWatchdog(pc.ID)
+		}
+		if runtime.GOOS == "linux" {
+			go removeWMBorder()
 		}
 	})
 	mygo.App.OnBeforeQuit(func(*mygo.QuitEvent) {

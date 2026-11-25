@@ -32,6 +32,9 @@
       position: absolute; inset: 0; width: 100%; height: 100%;
       opacity: 0; transition: opacity 0.16s ease;
       pointer-events: none;
+      /* the window can be smaller than the 640x360 canvas; ask WebKit for the
+         sharper scaler instead of the soft default */
+      image-rendering: -webkit-optimize-contrast;
     }
     video.visible { opacity: 1; }
     #bubble {
@@ -44,7 +47,7 @@
       border-radius: 14px;
       background: rgba(255, 255, 255, 0.95);
       color: #333;
-      font: 14px/1.4 -apple-system, "PingFang SC", sans-serif;
+      font: 14px/1.4 system-ui, -apple-system, "PingFang SC", "Noto Sans CJK SC", "Noto Sans SC", sans-serif;
       box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18);
       white-space: nowrap;
       overflow: hidden;
@@ -75,7 +78,7 @@
       overflow-y: auto;
       min-width: 150px;
       z-index: 10;
-      font: 13px/1.5 -apple-system, "PingFang SC", sans-serif;
+      font: 13px/1.5 system-ui, -apple-system, "PingFang SC", "Noto Sans CJK SC", "Noto Sans SC", sans-serif;
       color: #333;
     }
     #menu .mi { padding: 6px 12px; border-radius: 5px; cursor: pointer; white-space: nowrap; }
@@ -113,7 +116,16 @@
     let petId = "main";  // resolved from Pet.WhoAmI once the bridge is up
     let currentPlayback = null; // playbackId of the animation now on screen
 
-    const src = (name) => "anim/" + encodeURIComponent(name) + ".mov";
+    // WKWebView decodes HEVC-with-alpha .mov; WebKitGTK and WebView2 decode
+    // VP9-with-alpha .webm. MyGo injects `mygo.platform`; the user agent is the
+    // fallback if the page runs outside a MyGo window.
+    const platform = (() => {
+      try { return mygo.platform; } catch (e) { /* not in MyGo */ }
+      return /Mac/.test(navigator.userAgent) ? "darwin" : "linux";
+    })();
+    const ASSET_DIR = platform === "darwin" ? "anim/" : "anim-webm/";
+    const ASSET_EXT = platform === "darwin" ? ".mov" : ".webm";
+    const src = (name) => ASSET_DIR + encodeURIComponent(name) + ASSET_EXT;
 
     // Report a playback status back to the host (receipt via GET /playback/{id}).
     function report(playbackId, status) {

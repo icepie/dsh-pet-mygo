@@ -1,11 +1,13 @@
 # dsh-pet-mygo
 
 [dsh-pet](https://github.com/PC2005-cloud/dsh-pet) 的无 Electron / 无 DeepSeek Harness
-桌面端：用 [MyGo](https://github.com/egoist/mygo) 的透明置顶窗 + 系统 webview（WKWebView）
-播放 HEVC-with-alpha `.mov`，对外保持 dsh-pet 自己的 `/dsh-pet-7340` HTTP 契约。
+桌面端：用 [MyGo](https://github.com/egoist/mygo) 的透明置顶窗 + 系统 webview
+（macOS WKWebView / Linux WebKitGTK / Windows WebView2），按平台播放带 alpha 的
+HEVC `.mov` 或 VP9 `.webm`，对外保持 dsh-pet 自己的 `/dsh-pet-7340` HTTP 契约。
 
-**闸门实验已通过**：MyGo 透明无边框窗能透明渲染 HEVC-alpha mov（无黑框），因此整个
-桌宠可以不依赖 116MB 的 Electron 运行。
+**闸门实验已通过**：MyGo 透明无边框窗能透明渲染 HEVC-alpha mov（macOS）与
+VP9-alpha webm（Linux WebKitGTK，实测 X11 + picom），因此整个桌宠可以不依赖
+116MB 的 Electron 运行。
 
 ## 当前状态
 
@@ -27,7 +29,7 @@
   无缓存时用内置句子池降级。宠物运行时**不调模型**，批量生成一次能用很久
 - **屏幕漫游 + 朝向镜像**：朝随机方向行走不走出屏幕，朝左时视频水平翻转
 - **多显示器**：漫游与抛掷按窗口所在的显示器计算边界（`Screen.DisplayMatching`）
-- **单元测试**：12 个测试覆盖时长解析、动画链权重、契约端点、配置读写（`go test ./...`）
+- **单元测试**：18 个测试覆盖 moov/EBML 时长解析、动画链权重、契约端点、配置读写（`go test ./...`）
 - **多宠物 / 多窗口**：每只宠物独立窗口、独立状态与气泡，bridge 用 `CallerWindow` 区分
 - `/dsh-pet-7340` 契约端点：`GET /state`、`GET /config`、`POST /anim`（回 `playbackId`）、
   `GET /playback/{id}`（播放回执，状态含 `queued`）、`POST /playback/{id}/report`、`POST /whisper`、
@@ -35,7 +37,31 @@
   均按 `?pet=` 路由
 - 状态结构与 dsh-pet 一致（`pets.<id>.{say,anim,facing} = {counter, data}`），
   因此之前写的 [pi 桥接扩展](../../.pi/agent/extensions/dsh-pet.ts) **零改动**直接可用
-- 106 个 HEVC-alpha mov 素材（npm 包 VP9-alpha webm 全量转码）
+- 106 个动画素材，两套格式：HEVC-alpha mov（macOS，134MB）与 VP9-alpha webm
+  （Linux/Windows，56MB），页面按平台选目录与扩展名
+
+## 平台支持
+
+| 平台 | webview | 素材 | 透明 |
+|---|---|---|---|
+| macOS | WKWebView | HEVC-alpha `.mov`（`resources/anim`） | 实测可用 |
+| Linux | WebKitGTK 4.1 / 4.0 | VP9-alpha `.webm`（`resources/anim-webm`） | 实测 X11 + picom |
+| Windows | WebView2 | VP9-alpha `.webm` | 未实测 |
+
+Linux 运行依赖：
+
+- GTK 3 + WebKitGTK 4.1（没有时用 4.0）+ libsoup 3
+- GStreamer 的 VP9 解码（`gst-plugins-good`）与 VP9 alpha（`gst-plugins-bad`，
+  `vp9alphadecodebin`）
+- 合成器（picom / KWin / Mutter / Hyprland 等）：裸 X11 没有合成器时透明窗会显示黑底
+- 平铺窗口管理器（i3/sway）：Linux 窗口用 GTK utility 类型，保持浮动且全工作区可见，
+  不会被平铺拉伸；启动时还会通过 WM IPC（`I3SOCK` / `SWAYSOCK`）去掉 i3/sway 给浮动窗
+  画的焦点边框。若从没有该变量的环境启动，可在 WM 配置里加一行
+  `for_window [title="^dsh-pet$"] border none`
+
+点击穿透用 MyGo 的 `SetInputRegion`：Linux 上落到 X11 SHAPE / Wayland input region，
+命中区按当前动画的透明像素动态更新；右键菜单打开时临时放大到整窗。macOS / Windows
+由 MyGo 轮询指针切换。页面按 `mygo.platform` 选择 `anim/`+`.mov` 或 `anim-webm/`+`.webm`。
 
 ## 与原版对比
 
@@ -77,11 +103,16 @@
 ## 运行
 
 ```sh
-# 先转换素材（已转好可跳过；需要 macOS + ffmpeg + Xcode CLT）
+go run .        # 监听 http://127.0.0.1:3080，窗口播放 idle 动画
+go test ./...   # 时长解析 / 动画链 / 契约 / 配置
+```
+
+两套素材都已入库，直接可跑。只有重新生成 macOS 的 HEVC-alpha mov 时才需要
+macOS + ffmpeg + Xcode CLT 转码（webm 原素材来自 dsh-pet npm 包）：
+
+```sh
 ./scripts/encode-movs.sh 待机呼吸休闲 工作状态-思考冒泡 工作状态-忙碌点按 \
   工作状态-清点归档 工作状态-原地踱步张望 工作状态-雀跃庆祝 工作状态-垂头叹气冒汗
-
-go run .        # 监听 http://127.0.0.1:3080，窗口播放 idle 动画
 ```
 
 驱动它（与 dsh-pet / pi 桥接扩展同款调用）：
@@ -103,19 +134,19 @@ curl -s -X POST 'http://127.0.0.1:3080/dsh-pet-7340/broadcast?pet=main' \
 
 ```json
 {
-  "size": 1.0,
+  "size": 0.7,
   "pets": [
     { "id": "main", "x": 700, "y": 220 }
   ]
 }
 ```
 
-- `size`：整体缩放比例（0.3~2.0，1 = 原生 640×360 画布），窗口与命中区同步缩放。
+- `size`：整体缩放比例（0.3~2.0，1 = 原生 640×360 画布，默认 0.7），窗口与命中区同步缩放。
 - `pets`：每个元素一只宠物、一个独立窗口（`id` 不同即可多开）。
 - `x` / `y`：窗口左上角的逻辑屏幕坐标。
 
-> 注：MyGo 创建窗口时的 `X` 在小于约 221 时会被 AppKit clamp，所以本项目在创建后用
-> `SetPosition` 显式定位，配置里的任意坐标都能生效。
+> 注：macOS 上 MyGo 创建窗口时的 `X` 在小于约 221 时会被 AppKit clamp，所以本项目在
+> 创建后用 `SetPosition` 显式定位，配置里的任意坐标都能生效。
 
 ### 碎碎念句子（批量预生成）
 
